@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>ESP32 Scope</title>
+<style>
+:root{--bg:#0b0f14;--panel:#141b24;--line:#263445;--fg:#d7e3f0;--dim:#7d8da1;--tr:#35f08a;--acc:#ffb020;--bad:#ff5a5a}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:14px/1.2 system-ui,Roboto,sans-serif;overflow:hidden}
+#app{display:flex;flex-direction:column;height:100%}
+#scr{flex:1 1 auto;position:relative;min-height:0}
+canvas{position:absolute;left:0;top:0;width:100%;height:100%;display:block}
+#meas{position:absolute;left:10px;top:8px;font:12px/1.35 ui-monospace,Menlo,Consolas,monospace;color:var(--tr);pointer-events:none;text-shadow:0 0 3px #000}
+#stat{position:absolute;right:10px;top:8px;font:12px ui-monospace,Menlo,Consolas,monospace;color:var(--dim);pointer-events:none;text-align:right;text-shadow:0 0 3px #000}
+#ctl{flex:0 0 auto;background:var(--panel);border-top:1px solid var(--line);padding:6px 8px;overflow-y:auto;max-height:48%}
+@media (orientation:landscape) and (min-width:700px){
+  #app{flex-direction:row}
+  #ctl{width:310px;max-height:none;border-top:0;border-left:1px solid var(--line)}
+}
+.row{display:flex;gap:6px;margin:5px 0;align-items:center}
+.lab{flex:0 0 66px;color:var(--dim);font-size:11px;letter-spacing:.5px}
+.val{flex:1;text-align:center;font-weight:600;color:var(--acc)}
+button,select,input[type=text]{min-height:40px;background:#1d2835;border:1px solid var(--line);color:var(--fg);border-radius:8px;font-size:14px;padding:0 8px}
+.b{flex:1}
+.s{flex:0 0 52px;font-size:20px}
+.on{background:#1f5a3a;border-color:#2f8a5a}
+.stop{background:#5a1f1f;border-color:#8a2f2f}
+select{flex:1}
+input[type=text]{flex:1;min-width:0}
+input[type=range]{flex:1;height:34px;accent-color:#35f08a}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="scr"><canvas id="cv"></canvas><div id="meas"></div><div id="stat"></div></div>
+  <div id="ctl">
+    <div class="row">
+      <button class="b" id="run">RUN</button>
+      <button class="b" id="single">SINGLE</button>
+      <button class="b" id="auto">AUTOSET</button>
+    </div>
+    <div class="row"><span class="lab">TIME/DIV</span><button class="s" id="tm">&minus;</button><span class="val" id="tv"></span><button class="s" id="tp">+</button></div>
+    <div class="row"><span class="lab">VOLT/DIV</span><button class="s" id="vm">&minus;</button><span class="val" id="vv"></span><button class="s" id="vp">+</button></div>
+    <div class="row"><span class="lab">POSITION</span><input type="range" id="pos" min="-4" max="4" step="0.05" value="0"></div>
+    <div class="row"><span class="lab">TRIG LVL</span><input type="range" id="lvl" min="-4" max="4" step="0.05" value="0"></div>
+    <div class="row">
+      <button class="b" id="edge">EDGE &uarr;</button>
+      <button class="b" id="mode">AUTO</button>
+    </div>
+    <div class="row">
+      <select id="coup"><option value="ac">AC (&divide;3)</option><option value="dc">DC (&divide;3)</option><option value="dir">DIRECT 0-3.3V</option></select>
+      <select id="probe"><option value="1">Probe 1&times;</option><option value="10">Probe 10&times;</option></select>
+    </div>
+    <div class="row"><input type="text" id="host" placeholder="192.168.4.1" autocapitalize="off" autocomplete="off"><button class="b" id="conn" style="flex:0 0 96px">Connect</button></div>
+  </div>
+</div>
+<script>
+(function(){
+'use strict';
+var $=function(id){return document.getElementById(id)};
+var TB=[20,40,100,200,400,1000,2000,4000];   // nominal sample period (us) - same table as firmware
+var VD=[0.1,0.2,0.5,1,2,5];                  // volts/div before probe factor
+var N=500,GX=10,GY=8;
+var MODES=['AUTO','NORM','SING'];
+var S={tb:3,vd:3,pos:0,tl:0,edge:1,mode:0,run:1,coup:'ac',probe:1,host:''};
+try{var o=JSON.parse(localStorage.getItem('scope')||'{}');for(var k in o)S[k]=o[k];}catch(e){}
+S.run=1;
+var served=/^https?:$/.test(location.protocol);
+if(served&&location.hostname)S.host=location.hostname;else if(!S.host)S.host='192.168.4.1';
+function save(){try{localStorage.setItem('scope',JSON.stringify(S))}catch(e){}}
+function clamp(x,a,b){return Math.max(a,Math.min(b,x))}
+
+var F={s:null,per:TB[S.tb],pre:50,flags:0,waiting:false};
+var ws=null,conn=false,dirty=true,retry=null,fps=0,frames=0,t0=Date.now();
+
+/* ---------- conversions ---------- */
+function vdiv(){return VD[S.vd]*S.probe}
+function rawToV(r){
+  var n=r*3.3/4095,v;
+  if(S.coup==='ac')v=3*n-4.95;else if(S.coup==='dc')v=3*n-3.3;else v=n;
+  return v*S.probe;
+}
+function vToRaw(v){
+  v/=S.probe;var n;
+  if(S.coup==='ac')n=(v+4.95)/3;else if(S.coup==='dc')n=(v+3.3)/3;else n=v;
+  return clamp(Math.round(n/3.3*4095),0,4095);
+}
+function fmtT(us){
+  var v,u;
+  if(us>=1e6){v=us/1e6;u=' s'}else if(us>=1e3){v=us/1e3;u=' ms'}else{v=us;u=' µs'}
+  return (+v.toPrecision(3))+u;
+}
+function fmtV(v){var a=Math.abs(v);return a<1?(v*1000).toFixed(0)+' mV':v.toFixed(2)+' V'}
+function fmtF(f){return f>=1e6?(f/1e6).toFixed(3)+' MHz':f>=1e3?(f/1e3).toFixed(3)+' kHz':f.toFixed(2)+' Hz'}
+
+/* ---------- connection ---------- */
+function tx(k,v){if(ws&&ws.readyState===1)ws.send(k+'='+v)}
+function sendLvl(){tx('lvl',vToRaw((S.tl-S.pos)*vdiv()))}
+function sendAll(){tx('tb',S.tb);sendLvl();tx('edge',S.edge);tx('mode',S.mode);tx('run',S.run)}
+function connect(){
+  clearTimeout(retry);
+  if(ws){ws.onclose=null;try{ws.close()}catch(e){}}
+  conn=false;ui();
+  try{ws=new WebSocket('ws://'+S.host+':81/')}catch(e){retry=setTimeout(connect,2000);return}
+  ws.binaryType='arraybuffer';
+  ws.onopen=function(){conn=true;sendAll();ui()};
+  ws.onclose=function(){conn=false;ui();retry=setTimeout(connect,1500)};
+  ws.onerror=function(){};
+  ws.onmessage=function(e){
+    if(typeof e.data==='string')return;
+    var d=new DataView(e.data);
+    if(d.byteLength<12||d.getUint8(0)!==0xA5)return;
+    var fl=d.getUint8(1),n=d.getUint16(2,true);
+    F.flags=fl;F.waiting=(n===0);
+    if(n>0&&d.byteLength>=12+2*n){
+      var a=new Uint16Array(n);
+      for(var i=0;i<n;i++)a[i]=d.getUint16(12+2*i,true);
+      F.s=a;F.per=d.getFloat32(4,true);F.pre=d.getUint16(8,true);
+    }
+    var run=(fl&8)?1:0;
+    if(run!==S.run){S.run=run}
+    frames++;dirty=true;ui();
+  };
+}
+
+/* ---------- measurements ---------- */
+function measure(){
+  var s=F.s;if(!s||!s.length)return null;
+  var n=s.length,v=new Float32Array(n),mn=1e9,mx=-1e9,sum=0,sq=0,i;
+  for(i=0;i<n;i++){var x=rawToV(s[i]);v[i]=x;if(x<mn)mn=x;if(x>mx)mx=x;sum+=x;sq+=x*x}
+  var avg=sum/n,rms=Math.sqrt(sq/n),vpp=mx-mn,f=0;
+  if(vpp>0.05*S.probe){
+    var mid=(mx+mn)/2,hi=mid+0.1*vpp,lo=mid-0.1*vpp,st=v[0]>hi?1:0,cr=[];
+    for(i=1;i<n;i++){
+      if(st===0&&v[i]>hi){
+        st=1;var j=i;while(j>0&&v[j-1]>mid)j--;
+        if(j>0){cr.push(j-1+(mid-v[j-1])/(v[j]-v[j-1]))}
+      }else if(st===1&&v[i]<lo)st=0;
+    }
+    if(cr.length>=2){
+      var ps=(cr[cr.length-1]-cr[0])/(cr.length-1);
+      if(ps>=3)f=1e6/(ps*F.per);
+    }
+  }
+  return {min:mn,max:mx,avg:avg,rms:rms,vpp:vpp,f:f};
+}
+
+/* ---------- drawing ---------- */
+var cv=$('cv'),dpr=1;
+function fit(){
+  var r=cv.getBoundingClientRect();dpr=window.devicePixelRatio||1;
+  cv.width=Math.max(10,Math.round(r.width*dpr));cv.height=Math.max(10,Math.round(r.height*dpr));dirty=true;
+}
+function draw(){
+  var g=cv.getContext('2d'),w=cv.width,h=cv.height,m=Math.round(10*dpr);
+  var gx=m,gy=m*2.2,gw=w-2*m,gh=h-gy-m*1.6,i;
+  g.fillStyle='#05080c';g.fillRect(0,0,w,h);
+  g.lineWidth=1;
+  for(i=0;i<=GX;i++){g.strokeStyle=(i===0||i===GX)?'#3a4d63':(i===GX/2?'#2e4157':'#16222f');
+    var x=Math.round(gx+i*gw/GX)+.5;g.beginPath();g.moveTo(x,gy);g.lineTo(x,gy+gh);g.stroke()}
+  for(i=0;i<=GY;i++){g.strokeStyle=(i===0||i===GY)?'#3a4d63':(i===GY/2?'#2e4157':'#16222f');
+    var y=Math.round(gy+i*gh/GY)+.5;g.beginPath();g.moveTo(gx,y);g.lineTo(gx+gw,y);g.stroke()}
+  g.strokeStyle='#2e4157';g.beginPath();
+  for(i=0;i<GX*5;i++){var tx_=Math.round(gx+i*gw/(GX*5))+.5,cy=Math.round(gy+gh/2);g.moveTo(tx_,cy-3*dpr);g.lineTo(tx_,cy+3*dpr)}
+  for(i=0;i<GY*5;i++){var ty_=Math.round(gy+i*gh/(GY*5))+.5,cx=Math.round(gx+gw/2);g.moveTo(cx-3*dpr,ty_);g.lineTo(cx+3*dpr,ty_)}
+  g.stroke();
+
+  var vd=vdiv();
+  if(F.s){
+    var n=F.s.length;
+    g.save();g.beginPath();g.rect(gx,gy,gw,gh);g.clip();
+    g.strokeStyle='#35f08a';g.lineWidth=2*dpr;g.lineJoin='round';g.beginPath();
+    for(i=0;i<n;i++){
+      var yd=rawToV(F.s[i])/vd+S.pos;
+      var px=gx+i*gw/n,py=gy+gh/2-yd*gh/GY;
+      if(i)g.lineTo(px,py);else g.moveTo(px,py);
+    }
+    g.stroke();g.restore();
+    if(F.flags&1){ // trigger instant marker
+      var tx0=gx+F.pre*gw/n;g.fillStyle='#ffb020';g.beginPath();g.moveTo(tx0-6*dpr,gy);g.lineTo(tx0+6*dpr,gy);g.lineTo(tx0,gy+8*dpr);g.fill();
+    }
+  }
+  // 0 V marker (left) and trigger level marker (right)
+  var y0=gy+gh/2-S.pos*gh/GY;
+  if(y0>=gy&&y0<=gy+gh){g.fillStyle='#4fc3f7';g.beginPath();g.moveTo(gx,y0-6*dpr);g.lineTo(gx+10*dpr,y0);g.lineTo(gx,y0+6*dpr);g.fill();
+    g.font=(10*dpr)+'px sans-serif';g.fillText('0',gx+12*dpr,y0+4*dpr)}
+  var yt=gy+gh/2-S.tl*gh/GY;
+  if(yt>=gy&&yt<=gy+gh){
+    g.strokeStyle='rgba(255,176,32,.35)';g.setLineDash([4*dpr,5*dpr]);g.beginPath();g.moveTo(gx,yt);g.lineTo(gx+gw,yt);g.stroke();g.setLineDash([]);
+    g.fillStyle='#ffb020';g.beginPath();g.moveTo(gx+gw,yt-6*dpr);g.lineTo(gx+gw-10*dpr,yt);g.lineTo(gx+gw,yt+6*dpr);g.fill();
+  }
+  g.fillStyle='#d7e3f0';g.font='bold '+(12*dpr)+'px sans-serif';
+  g.fillText(fmtV(vd)+'/div     '+fmtT(F.per*N/GX)+'/div',gx+2*dpr,gy+gh+m*1.15);
+  if(!F.s){g.fillStyle='#7d8da1';g.font=(16*dpr)+'px sans-serif';g.textAlign='center';
+    g.fillText(conn?'Waiting for trigger / data...':'Not connected',gx+gw/2,gy+gh/2);g.textAlign='left'}
+  // text overlays
+  var me=measure(),mt='';
+  if(me){mt='Vpp  '+fmtV(me.vpp)+'\nMax  '+fmtV(me.max)+'\nMin  '+fmtV(me.min)+'\nAvg  '+fmtV(me.avg)+'\nRMS  '+fmtV(me.rms)+'\nFreq '+(me.f?fmtF(me.f):'--')+(me.f?'\nT    '+fmtT(1e6/me.f):'')}
+  $('meas').textContent=mt;$('meas').style.whiteSpace='pre';
+  var tr=!conn?'OFFLINE':F.waiting?'WAIT':(F.flags&1)?'TRIG\'D':(S.mode===0?'AUTO':'--');
+  $('stat').textContent=(conn?'● ':'○ ')+S.host+'\n'+tr+'  '+(F.per?(1e3/F.per).toFixed(1)+' kS/s':'')+'  '+fps+' fps';
+}
+function loop(){if(dirty){dirty=false;draw()}requestAnimationFrame(loop)}
+setInterval(function(){var t=Date.now();fps=Math.round(frames*1000/(t-t0));frames=0;t0=t;dirty=true},1000);
+
+/* ---------- UI ---------- */
+function ui(){
+  $('tv').textContent=fmtT(F.per*N/GX)+'/div';
+  $('vv').textContent=fmtV(vdiv())+'/div';
+  $('run').textContent=S.run?'STOP':'RUN';
+  $('run').className='b '+(S.run?'stop':'on');
+  $('edge').innerHTML='EDGE '+(S.edge?'&uarr;':'&darr;');
+  $('mode').textContent=MODES[S.mode];
+  $('single').className='b'+(S.mode===2&&S.run?' on':'');
+  $('conn').className='b'+(conn?' on':'');
+  dirty=true;
+}
+function lvlChanged(){sendLvl();save();dirty=true}
+function setTb(i){S.tb=clamp(i,0,TB.length-1);F.per=TB[S.tb];tx('tb',S.tb);save();ui()}
+function setVd(i){S.vd=clamp(i,0,VD.length-1);sendLvl();save();ui()}
+
+$('run').onclick=function(){S.run=S.run?0:1;tx('run',S.run);ui()};
+$('single').onclick=function(){S.mode=2;S.run=1;tx('mode',2);tx('run',1);save();ui()};
+$('tm').onclick=function(){setTb(S.tb-1)};
+$('tp').onclick=function(){setTb(S.tb+1)};
+$('vm').onclick=function(){setVd(S.vd-1)};
+$('vp').onclick=function(){setVd(S.vd+1)};
+$('pos').oninput=function(){S.pos=+this.value;lvlChanged()};
+$('lvl').oninput=function(){S.tl=+this.value;lvlChanged()};
+$('edge').onclick=function(){S.edge=S.edge?0:1;tx('edge',S.edge);save();ui()};
+$('mode').onclick=function(){S.mode=(S.mode+1)%3;tx('mode',S.mode);if(S.mode!==2){S.run=1;tx('run',1)}save();ui()};
+$('coup').onchange=function(){S.coup=this.value;lvlChanged();ui()};
+$('probe').onchange=function(){S.probe=+this.value;lvlChanged();ui()};
+$('conn').onclick=function(){var h=$('host').value.trim();if(h){S.host=h;save()}connect()};
+$('auto').onclick=function(){
+  var m=measure();if(!m)return;
+  var k=VD.length-1,i;
+  for(i=0;i<VD.length;i++){if(m.vpp/(VD[i]*S.probe)<=6){k=i;break}}
+  S.vd=k;S.pos=clamp(-((m.max+m.min)/2)/vdiv(),-4,4);S.tl=0;
+  if(m.f){
+    var want=0.3/m.f*1e6,best=0,bd=1e9;
+    for(i=0;i<TB.length;i++){var d=Math.abs(Math.log(TB[i]*N/GX/want));if(d<bd){bd=d;best=i}}
+    S.tb=best;F.per=TB[best];
+  }
+  $('pos').value=S.pos;$('lvl').value=S.tl;
+  tx('tb',S.tb);sendLvl();S.mode=0;tx('mode',0);S.run=1;tx('run',1);save();ui();
+};
+
+$('coup').value=S.coup;$('probe').value=String(S.probe);
+$('pos').value=S.pos;$('lvl').value=S.tl;$('host').value=S.host;
+window.addEventListener('resize',fit);
+if(window.ResizeObserver)new ResizeObserver(fit).observe($('scr'));
+fit();ui();connect();loop();
+})();
+</script>
+</body>
+</html>
